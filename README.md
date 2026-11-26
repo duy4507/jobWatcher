@@ -16,13 +16,13 @@ Mistral Studio):
    0-100 against the candidate profile with reasons, returned as JSON.
 3. Postings already seen or below `min_score` (default 70) are filtered out; the top
    `max_results` (default 10) are rendered into an HTML digest.
-4. `send-digest-email` sends the digest through the `gmail` connector — or, with
+4. `send-digest-email` sends the digest through the Gmail REST API — or, with
    `dry_run: true` (the default), saves it as a Gmail draft instead of sending.
 
 ## Layout
 
 - `worker.py` — worker entrypoint (`workflows.run_worker`).
-- `workflows/job_watcher.py` — the `job-watcher` workflow + activities (Gmail connector,
+- `workflows/job_watcher.py` — the `job-watcher` workflow + activities (Gmail REST API,
   web-search agent).
 - `workflows/job_watcher_digest.py` — pure helpers: input/output models, agent-JSON
   parsing, digest rendering, `SEEN:` dedup marker.
@@ -50,7 +50,11 @@ The schedule passes a JSON input, e.g.:
 
 ## Notes
 
-- Scheduled runs have no user session, so the `gmail` connector needs a
-  **workspace-scope credential** in Mistral Studio (Connectors), not only the personal
-  OAuth one.
+- Scheduled runs have no user session, and the `gmail` connector is OAuth-only (user
+  credentials), so the workflow calls the Gmail REST API directly. Auth uses an OAuth
+  refresh token from the worker environment, bound at deploy time from these
+  **workspace secrets** (Studio → Secrets):
+  - `gmail_client_id`, `gmail_client_secret`, `gmail_refresh_token` — from a Google
+    Cloud OAuth client (desktop app) authorized for the Gmail account with scopes
+    `gmail.send` and `gmail.modify` (read for dedup).
 - `dry_run: true` creates a draft instead of sending, for safe first runs.

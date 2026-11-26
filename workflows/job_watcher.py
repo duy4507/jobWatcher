@@ -1,22 +1,24 @@
 """Daily job-posting watcher.
 
-Runs on a schedule (no triggering user, so not on_behalf_of): a durable agent with web
-search finds postings posted in the last `lookback_hours` that match the profile, filters
-out ids already reported in earlier digest emails, and sends an HTML digest through the
-gmail connector. `dry_run=True` creates a draft instead of sending.
+Runs on a schedule (no triggering user, so not on_behalf_of and no connector slots):
+a durable agent with web search finds postings posted in the last `lookback_hours` that
+match the profile, filters out ids already reported in earlier digest emails, and sends
+an HTML digest through the Gmail REST API. Gmail auth uses an OAuth refresh token from
+the worker's environment (GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN,
+bound from workspace secrets at deploy time), because the gmail connector is OAuth-only
+and cannot resolve credentials for unattended runs. `dry_run=True` creates a draft
+instead of sending.
 """
 
+import base64
+import os
 from datetime import timedelta
+from email.message import EmailMessage
 
+import requests
 import mistralai.client.models
 import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
-from mistralai.workflows import Depends
-from mistralai.workflows.plugins.mistralai.connectors import (
-    ToolCallClient,
-    connector,
-    uses_connectors,
-)
 
 from workflows.job_watcher_digest import (
     SEEN_LINE_RE,
@@ -27,7 +29,8 @@ from workflows.job_watcher_digest import (
     parse_postings_json,
 )
 
-gmail = connector("gmail")
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 SEARCH_INSTRUCTIONS = """You are a job-search agent for a candidate in France.
 
@@ -55,12 +58,62 @@ Your FINAL message must be ONLY a JSON array (no prose, no markdown fences), one
 """
 
 
-def _dump(result: object) -> dict:
-    if hasattr(result, "model_dump"):
-        return result.model_dump()  # type: ignore[union-attr]
-    if isinstance(result, dict):
-        return result
-    return {"raw": str(result)}
+def _gmail_access_token() -> str:
+    response = requests.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": os.environ["GMAIL_CLIENT_ID"],
+            "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
+            "refresh_token": os.environ["GMAIL_REFRESH_TOKEN"],
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def _gmail_get(path: str, params: dict | None = None) -> dict:
+    response = requests.get(
+        f"{GMAIL_API}/{path}",
+        params=params,
+        headers={"Authorization": f"Bearer {_gmail_access_token()}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _gmail_post(path: str, payload: dict) -> dict:
+    response = requests.post(
+        f"{GMAIL_API}/{path}",
+        json=payload,
+        headers={"Authorization": f"Bearer {_gmail_access_token()}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _message_text(message: dict) -> str:
+    payload = message.get("payload") or {}
+    parts = payload.get("parts") or []
+    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
+        parts = [payload]
+    for part in parts:
+        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", "replace")
+    return message.get("snippet") or ""
+
+
+def _raw_mime(to: str, subject: str, text_body: str, html_body: str) -> str:
+    msg = EmailMessage()
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["From"] = "me"
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
 
 @workflows.activity(
@@ -71,31 +124,25 @@ def _dump(result: object) -> dict:
 async def fetch_seen_posting_ids(
     digest_prefix: str,
     seen_window_days: int,
-    client: ToolCallClient = Depends(gmail),
 ) -> list[str]:
     """Read SEEN lines from previously sent digest emails to deduplicate postings."""
     seen: set[str] = set()
     page_token: str | None = None
     for _ in range(5):
-        arguments: dict = {
-            "query": f'in:sent subject:"{digest_prefix}" newer_than:{seen_window_days}d',
-            "pageSize": 50,
+        params: dict = {
+            "q": f'in:sent subject:"{digest_prefix}" newer_than:{seen_window_days}d',
+            "maxResults": 50,
         }
         if page_token:
-            arguments["pageToken"] = page_token
-        result = _dump(await client.call_tool(tool_name="search_threads", arguments=arguments))
+            params["pageToken"] = page_token
+        result = _gmail_get("threads", params)
         for thread in result.get("threads") or []:
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not thread_id:
                 continue
-            thread_data = _dump(
-                await client.call_tool(tool_name="get_thread", arguments={"threadId": thread_id})
-            )
+            thread_data = _gmail_get(f"threads/{thread_id}")
             for message in thread_data.get("messages") or []:
-                if not isinstance(message, dict):
-                    continue
-                body = message.get("plaintextBody") or message.get("snippet") or ""
-                match = SEEN_LINE_RE.search(body)
+                match = SEEN_LINE_RE.search(_message_text(message))
                 if match:
                     seen.update(
                         item.strip().strip(".,;")
@@ -160,14 +207,8 @@ async def send_digest_email(
     subject: str,
     text_body: str,
     html_body: str,
-    client: ToolCallClient = Depends(gmail),
 ) -> dict:
-    return _dump(
-        await client.call_tool(
-            tool_name="send_email",
-            arguments={"to": [to], "subject": subject, "body": text_body, "htmlBody": html_body},
-        )
-    )
+    return _gmail_post("messages/send", {"raw": _raw_mime(to, subject, text_body, html_body)})
 
 
 @workflows.activity(
@@ -180,18 +221,13 @@ async def create_digest_draft(
     subject: str,
     text_body: str,
     html_body: str,
-    client: ToolCallClient = Depends(gmail),
 ) -> dict:
-    return _dump(
-        await client.call_tool(
-            tool_name="create_draft",
-            arguments={"to": [to], "subject": subject, "body": text_body, "htmlBody": html_body},
-        )
+    return _gmail_post(
+        "drafts/create", {"message": {"raw": _raw_mime(to, subject, text_body, html_body)}}
     )
 
 
 @workflows.workflow.define(name="job-watcher")
-@uses_connectors(gmail)
 class JobWatcherWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, data: JobWatcherInput) -> JobWatcherOutput:
