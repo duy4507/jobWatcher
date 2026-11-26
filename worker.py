@@ -1,28 +1,14 @@
-"""Worker entrypoint: registers the job-watcher workflow and its activities and serves them."""
+"""Worker entrypoint: registers the job-watcher workflow and serves it (activities auto-register)."""
 
 import asyncio
 
 import mistralai.workflows as workflows
 
-from workflows.job_watcher import (
-    JobWatcherWorkflow,
-    create_digest_draft,
-    fetch_seen_posting_ids,
-    search_job_postings,
-    send_digest_email,
-)
+from workflows.job_watcher import JobWatcherWorkflow
 
 
 async def main() -> None:
-    await workflows.run_worker(
-        [
-            JobWatcherWorkflow,
-            fetch_seen_posting_ids,
-            search_job_postings,
-            send_digest_email,
-            create_digest_draft,
-        ]
-    )
+    await workflows.run_worker([JobWatcherWorkflow])
 
 
 if __name__ == "__main__":
